@@ -50,7 +50,12 @@ fn top_focus(root: &Node) -> Option<&Node> {
 
 
 enum ResizeResult { Success, NoSpace }
-
+/// Try to set a node to the desired size: (parent_width/number_of_children)
+/// Can have three different outcomes:
+/// * `Ok(ResizeResult::Success)` -- Resize call was succesful
+/// * `Ok(ResizeResult::NoSpace)` -- Resize call failed due to there not being 
+///                                  space to take from the adjacent child
+/// * `Err(AppError::Resize)` -- Something went wrong calling resize through ipc
 fn resize_node(conn: &mut Connection, n: &Node, parent: &Node) 
 -> Result<ResizeResult, AppError> {
     let Node{ id: child_id, .. } = n;
@@ -78,9 +83,11 @@ fn resize_node(conn: &mut Connection, n: &Node, parent: &Node)
     }
 }
 
-fn get_latest_info(conn: &mut Connection, id: i64) -> Result<Node, AppError> {
+/// For a given node id, get its info using a new swayipc call
+fn get_latest_info(conn: &mut Connection, node_id: i64) 
+-> Result<Node, AppError> {
     let tree = conn.get_tree().map_err(|_| AppError::GetTree)?;
-    find_by_id(&tree, id).ok_or(AppError::NodeGone).cloned()
+    find_by_id(&tree, node_id).ok_or(AppError::NodeGone).cloned()
 }
 
 fn balance(conn: &mut Connection, root: &Node) -> Result<(), AppError> {
@@ -136,16 +143,15 @@ fn main() -> Result<(),AppError> {
     let workspaces = conn.get_workspaces()
         .map_err(|_| AppError::GetWorkspaces)?;
 
-    // UNWRAP: There should always be at least one active workspace, right?
-    let active_workspace = workspaces.iter()
+    let focused_workspace = workspaces.iter()
         .find(|w| w.focused)
         .ok_or(AppError::NoFocus)?;
-    let ws_node = find_by_id(&tree, active_workspace.id)
+    let focused_workspace_node = find_by_id(&tree, focused_workspace.id)
         .ok_or(AppError::NoFocus)?;
 
     let to_balance = match arg_matches.get_flag("focus") {
-        true => top_focus(ws_node).ok_or(AppError::NoFocus)?,
-        false => ws_node,
+        true => top_focus(focused_workspace_node).ok_or(AppError::NoFocus)?,
+        false => focused_workspace_node,
     };
     
     balance(&mut conn, to_balance)
