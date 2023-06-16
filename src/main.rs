@@ -12,8 +12,10 @@ pub enum AppError {
     GetTree,
     #[error("Could not get the workspaces") ]
     GetWorkspaces,
-    #[error("Error issuing reize command") ]
+    #[error("Error issuing resize command") ]
     Resize,
+    #[error("Error issuing swap command") ]
+    Swap,
     #[error("Node disappeared while running") ]
     NodeGone,
     #[error("Current focus could not be determined") ]
@@ -48,41 +50,6 @@ fn top_focus(root: &Node) -> Option<&Node> {
     bfsearch(root, |n| n.focused)
 }
 
-
-enum ResizeResult { Success, NoSpace }
-/// Try to set a node to the desired size: (parent_width/number_of_children)
-/// Can have three different outcomes:
-/// * `Ok(ResizeResult::Success)` -- Resize call was succesful
-/// * `Ok(ResizeResult::NoSpace)` -- Resize call failed due to there not being 
-///                                  space to take from the adjacent child
-/// * `Err(AppError::Resize)` -- Something went wrong calling resize through ipc
-fn resize_node(conn: &mut Connection, n: &Node, parent: &Node) 
--> Result<ResizeResult, AppError> {
-    let Node{ id: child_id, .. } = n;
-    let Node{ nodes: children, .. } = parent;
-
-    let (get_dim, dir): (fn(&Node) -> i32, &str)= match parent.layout {
-        NodeLayout::SplitH => (|n| n.rect.width, "right"),
-        NodeLayout::SplitV => (|n| n.rect.height, "down"),
-        _ => return Ok(ResizeResult::Success),
-    };
-
-    let desired_dim = get_dim(parent) / children.len() as i32;
-    let diff = desired_dim - get_dim(n);
-
-    let change = if diff < 0 { "shrink" } else { "grow" };
-    let diff = diff.abs();
-
-    let cmd = format!("[con_id={child_id}] resize {change} {dir} {diff} px");
-    let res = conn.run_command(cmd).map_err(|_| AppError::Resize)?;
-
-    match res.first().ok_or(AppError::Resize)? {
-        Ok(_)                   => Ok(ResizeResult::Success),
-        Err(CommandParse(_))    => Ok(ResizeResult::NoSpace),
-        Err(_)                  => Err(AppError::Resize),
-    }
-}
-
 /// For a given node id, get its info using a new swayipc call
 fn get_latest_info(conn: &mut Connection, node_id: i64) 
 -> Result<Node, AppError> {
@@ -90,33 +57,79 @@ fn get_latest_info(conn: &mut Connection, node_id: i64)
     find_by_id(&tree, node_id).ok_or(AppError::NodeGone).cloned()
 }
 
-fn balance(conn: &mut Connection, root: &Node) -> Result<(), AppError> {
-    let mut q: VecDeque<i64> = VecDeque::from(vec![root.id]);
+fn reorder(conn: &mut Connection, parent: Node) 
+-> Result<Vec<(i64,i64)>, AppError> {
+    let swaps_made: Vec<(i64, i64)> = Vec::new();
 
+    type DimGetter = fn(&Node) -> i32;
+    let (get_dim, get_pos): (DimGetter, DimGetter) = match parent.layout {
+        NodeLayout::SplitH => (|n| n.rect.width, |n| n.rect.x),
+        NodeLayout::SplitV => (|n| n.rect.height, |n| n.rect.y),
+        _ => unreachable!("Handled in caller"),
+    };
+
+    let desired_dim = get_dim(&parent) / parent.nodes.len() as i32;
+    eprintln!("Desired dim: {}", desired_dim);
+    let (child1, child2) = (parent.nodes.get(0).unwrap(), parent.nodes.get(1).unwrap());
+    let gaps_size = get_pos(child2) - (get_pos(child1) + get_dim(child1));
+
+    // Once this returns None, all children are in a position such that 
+    // resizing from left to right should be possible without errors
+    let find_faulty = |children: &[Node]| -> Option<Node> { 
+        for (idx, child) in children.iter().enumerate() {
+            let gaps = gaps_size + (gaps_size as f32 * (idx as f32 + 0.5)).round() as i32;
+            eprintln!("gaps: {:?}", gaps);
+            let min_allowed = get_pos(&parent) + gaps + ((idx+1) as i32 * desired_dim);
+            eprintln!("{:?}: {}+{} < {}", child.name,
+                get_pos(child), get_dim(child), min_allowed
+            );
+            if get_pos(child) + get_dim(child) < min_allowed {
+                return Some(child.clone())
+            }
+        }
+        None
+    };
+
+    // Greedily child in faulty position with largest remaining sibling
+    let mut parent = parent.clone();
+    while let Some(child) = find_faulty(&parent.nodes) {
+        let largest_remaining = parent.nodes.iter()
+            .skip_while(|n| n.id != child.id).skip(1)
+            .max_by(|x,y| i32::cmp(&get_dim(x), &get_dim(y)))
+            .ok_or(AppError::Swap)?; // Better error?
+
+        let cmd = format!("swaymsg [con_id={}] swap container with con_id {}",
+            child.id, largest_remaining.id);
+
+        let res = conn.run_command(cmd).map_err(|_| AppError::Swap)?;
+        res.first()
+            .ok_or(AppError::Resize)?
+            .as_ref().map_err(|_|AppError::Resize)?;
+
+        // Get the new state of the workspace after the swap
+        parent = get_latest_info(conn, parent.id)
+            .map_err(|_| AppError::NodeGone)?;
+    }
+
+    Ok(swaps_made)
+}
+
+fn balance2(conn: &mut Connection, root: &Node) -> Result<(), AppError> {
+    let mut q: VecDeque<i64> = VecDeque::from(vec![root.id]);
+    
     while let Some(cur_id) = q.pop_front() {
         if root.nodes.is_empty() { return Ok(()) }
 
         let cur = get_latest_info(conn, cur_id)?;
         if cur.nodes.is_empty() { continue }
 
-        // Resizing to the required size might fail for some of the nodes 
-        // So we just retry the resizing until it succeeds or until we have
-        // done an iteration for each child
-        // TODO: is that always enough iterations?
-        for _ in 0..cur.nodes.len() {
-            let mut succeeded = true;
-            // Once all except the last been resized, 
-            // the last one should already have the right size
-            let all_except_last = cur.nodes.iter().take(cur.nodes.len()-1);
+        let initial_order = cur.nodes.iter()
+            .map(|Node { id, ..}| *id)
+            .collect::<Vec<i64>>();
 
-            for Node { id: child_id, .. } in all_except_last {
-                let child = get_latest_info(conn, *child_id)?;
-                if let ResizeResult::NoSpace = resize_node(conn, &child, &cur)? {
-                    succeeded = false;
-                }
-            }
-            if succeeded { break }
-        }
+        reorder(conn, cur.clone())?;
+        // balance
+        
         q.extend(cur.nodes.iter().map(|n| n.id));
     }
 
@@ -154,6 +167,6 @@ fn main() -> Result<(),AppError> {
         false => focused_workspace_node,
     };
     
-    balance(&mut conn, to_balance)
+    balance2(&mut conn, to_balance)
 }
 
