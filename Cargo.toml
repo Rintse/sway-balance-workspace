@@ -1,7 +1,7 @@
 [package]
 name = "sway-balance-workspace"
 version = "0.1.0"
-edition = "2023"
+edition = "2021"
 description = "Balances a sway workspace or some subset thereof (the focus)"
 license = "MIT"
 repository = "https://github.com/Rintse/sway-balance-workspace/"
