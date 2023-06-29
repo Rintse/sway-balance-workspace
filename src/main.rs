@@ -67,7 +67,8 @@ fn resize_node(conn: &mut Connection, n: &Node, parent: &Node)
         _ => return Ok(ResizeResult::Success),
     };
 
-    let desired_dim = get_dim(parent) / children.len() as i32;
+    let total_width: i32 = children.iter().map(get_dim).sum();
+    let desired_dim = total_width / children.len() as i32;
     let diff = desired_dim - get_dim(n);
 
     let change = if diff < 0 { "shrink" } else { "grow" };
