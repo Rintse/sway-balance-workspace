@@ -1,7 +1,12 @@
 [package]
-name = "sway-balance"
+name = "sway-balance-workspace"
 version = "0.1.0"
 edition = "2021"
+description = "Balances a sway workspace or some subset thereof (the focus)"
+license = "MIT"
+repository = "https://github.com/Rintse/sway-balance-workspace/"
+keywords = ["sway", "linux", "wm"]
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
