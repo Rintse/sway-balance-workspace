@@ -43,48 +43,16 @@ fn find_by_id(root: &Node, id: i64) -> Option<&Node> {
     bfsearch(root, |n| n.id == id)
 }
 
-/// Find the highest level node that is focused
+/// Find the highest level node that is focused. 
+/// This should be the "largest" container that is focused
 fn top_focus(root: &Node) -> Option<&Node> {
     bfsearch(root, |n| n.focused)
 }
 
 
-enum ResizeResult { Success, NoSpace }
-/// Try to set a node to the desired size: (parent_width/number_of_children)
-/// Can have three different outcomes:
-/// * `Ok(ResizeResult::Success)` -- Resize call was succesful
-/// * `Ok(ResizeResult::NoSpace)` -- Resize call failed due to there not being 
-///                                  space to take from the adjacent child
-/// * `Err(AppError::Resize)` -- Something went wrong calling resize through ipc
-fn resize_node(conn: &mut Connection, n: &Node, parent: &Node) 
--> Result<ResizeResult, AppError> {
-    let Node{ id: child_id, .. } = n;
-    let Node{ nodes: children, .. } = parent;
-
-    let (get_dim, dir): (fn(&Node) -> i32, &str)= match parent.layout {
-        NodeLayout::SplitH => (|n| n.rect.width, "right"),
-        NodeLayout::SplitV => (|n| n.rect.height, "down"),
-        _ => return Ok(ResizeResult::Success),
-    };
-
-    let total_width: i32 = children.iter().map(get_dim).sum();
-    let desired_dim = total_width / children.len() as i32;
-    let diff = desired_dim - get_dim(n);
-
-    let change = if diff < 0 { "shrink" } else { "grow" };
-    let diff = diff.abs();
-
-    let cmd = format!("[con_id={child_id}] resize {change} {dir} {diff} px");
-    let res = conn.run_command(cmd).map_err(|_| AppError::Resize)?;
-
-    match res.first().ok_or(AppError::Resize)? {
-        Ok(_)                   => Ok(ResizeResult::Success),
-        Err(CommandParse(_))    => Ok(ResizeResult::NoSpace),
-        Err(_)                  => Err(AppError::Resize),
-    }
-}
-
 /// For a given node id, get its info using a new swayipc call
+/// Calling swayipc each time we do this makes sense at the moment because we 
+/// only use info about one node once before altering the state again.
 fn get_latest_info(conn: &mut Connection, node_id: i64) 
 -> Result<Node, AppError> {
     let tree = conn.get_tree().map_err(|_| AppError::GetTree)?;
@@ -95,26 +63,58 @@ fn balance(conn: &mut Connection, root: &Node) -> Result<(), AppError> {
     let mut q: VecDeque<i64> = VecDeque::from(vec![root.id]);
 
     while let Some(cur_id) = q.pop_front() {
-        if root.nodes.is_empty() { return Ok(()) }
-
         let cur = get_latest_info(conn, cur_id)?;
         if cur.nodes.is_empty() { continue }
 
-        // Resizing to the required size might fail for some of the nodes 
-        // So we just retry the resizing until it succeeds or until we have
-        // done an iteration for each child
-        // TODO: is that always enough iterations?
-        for _ in 0..cur.nodes.len() {
+        let (get_dim, dir): (fn(&Node) -> i32, &str)= match cur.layout {
+            NodeLayout::SplitH => (|n| n.rect.width, "right"),
+            NodeLayout::SplitV => (|n| n.rect.height, "down"),
+            _ => break,
+        };
+
+        let sum_dim: i32 = cur.nodes.iter().map(get_dim).sum();
+        let desired_dim = sum_dim / cur.nodes.len() as i32;
+
+        loop {
+            // Loop until we were able to resize all children to the requested
+            // size. This may take multiple tries if there is not enough space
+            // in the adjacent container to grow into.
             let mut succeeded = true;
+
             // Once all except the last been resized, 
             // the last one should already have the right size
-            let all_except_last = cur.nodes.iter().take(cur.nodes.len()-1);
+            let all_except_last = cur.nodes.iter()
+                .take(cur.nodes.len()-1)
+                .map(|Node {id,..}| id);
 
-            for Node { id: child_id, .. } in all_except_last {
-                let child = get_latest_info(conn, *child_id)?;
-                if let ResizeResult::NoSpace = resize_node(conn, &child, &cur)? {
-                    succeeded = false;
-                }
+            for child_id in all_except_last {
+                let child = get_latest_info(conn, *child_id).unwrap();
+                let diff = desired_dim - get_dim(&child);
+
+                let change = if diff < 0 { "shrink" } else { "grow" };
+                let diff = diff.abs();
+
+                let child_id = child.id;
+                let cmd = format!("[con_id={child_id}] resize {change} {dir} {diff} px");
+
+                // run_command returns a Result<Vec<Result<_,_>>,_>.
+                // The outermost result indicates whether executing the command 
+                // went wrong in some way. The innermost vector of results
+                // indicates, for each command, the result of executing the 
+                // command. The outermost Result may not go wrong here
+                let res = conn.run_command(cmd).map_err(|_| AppError::Resize)?;
+
+                // The innermost command can only be of the "cannot resize" type
+                // any other error is unexpected and should propegate
+                if let Err(e) = res.first().unwrap() {
+                    match e {
+                        CommandParse(e) => match e.as_str() {
+                            "Cannot resize any further" => succeeded = false,
+                            _ => return Err(AppError::Resize),
+                        },
+                        _ => return Err(AppError::Resize),
+                    }
+                };
             }
             if succeeded { break }
         }
