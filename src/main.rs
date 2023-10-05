@@ -74,8 +74,10 @@ fn balance(conn: &mut Connection, root: &Node) -> Result<(), AppError> {
 
         let sum_dim: i32 = cur.nodes.iter().map(get_dim).sum();
         let desired_dim = sum_dim / cur.nodes.len() as i32;
-
-        loop {
+        // This should happen at most (\Sum_{k=1}^{num_of_children} k) times
+        let n = cur.nodes.len() as f64;
+        let max_iterations = (0.5 * n * (n + 1.0)).round() as usize;
+        for _ in 1..max_iterations {
             // Loop until we were able to resize all children to the requested
             // size. This may take multiple tries if there is not enough space
             // in the adjacent container to grow into.
