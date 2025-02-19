@@ -1,39 +1,38 @@
+use clap::{Arg, Command};
 use std::collections::VecDeque;
-use swayipc::{Connection, Node, NodeLayout};
 use swayipc::Error::CommandParse;
-use clap::{Command, Arg};
-
+use swayipc::{Connection, Node, NodeLayout};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("Could not open a connection to sway") ]
+    #[error("Could not open a connection to sway")]
     Conn,
-    #[error("Could not get the node layout tree") ]
+    #[error("Could not get the node layout tree")]
     GetTree,
-    #[error("Could not get the workspaces") ]
+    #[error("Could not get the workspaces")]
     GetWorkspaces,
-    #[error("Error issuing reize command") ]
+    #[error("Error issuing reize command")]
     Resize,
-    #[error("Node disappeared while running") ]
+    #[error("Node disappeared while running")]
     NodeGone,
-    #[error("Current focus could not be determined") ]
+    #[error("Current focus could not be determined")]
     NoFocus,
 }
 
-
 /// Breadth first search for the first node for which `predicate` holds
-fn bfsearch<'a>(root: &'a Node, predicate: impl Fn(&'a Node) -> bool)
--> Option<&'a Node> 
-{
+fn bfsearch<'a>(
+    root: &'a Node,
+    predicate: impl Fn(&'a Node) -> bool,
+) -> Option<&'a Node> {
     let mut q = VecDeque::from(vec![root]);
 
     while let Some(n) = q.pop_front() {
-        if predicate(n) { 
-            return Some(n) 
+        if predicate(n) {
+            return Some(n);
         }
 
         q.extend(n.nodes.iter());
-    };
+    }
 
     None // Never found
 }
@@ -43,20 +42,23 @@ fn find_by_id(root: &Node, id: i64) -> Option<&Node> {
     bfsearch(root, |n| n.id == id)
 }
 
-/// Find the highest level node that is focused. 
+/// Find the highest level node that is focused.
 /// This should be the "largest" container that is focused
 fn top_focus(root: &Node) -> Option<&Node> {
     bfsearch(root, |n| n.focused)
 }
 
-
 /// For a given node id, get its info using a new swayipc call
-/// Calling swayipc each time we do this makes sense at the moment because we 
+/// Calling swayipc each time we do this makes sense at the moment because we
 /// only use info about one node once before altering the state again.
-fn get_latest_info(conn: &mut Connection, node_id: i64) 
--> Result<Node, AppError> {
+fn get_latest_info(
+    conn: &mut Connection,
+    node_id: i64,
+) -> Result<Node, AppError> {
     let tree = conn.get_tree().map_err(|_| AppError::GetTree)?;
-    find_by_id(&tree, node_id).ok_or(AppError::NodeGone).cloned()
+    find_by_id(&tree, node_id)
+        .ok_or(AppError::NodeGone)
+        .cloned()
 }
 
 fn balance(conn: &mut Connection, root: &Node) -> Result<(), AppError> {
@@ -64,9 +66,11 @@ fn balance(conn: &mut Connection, root: &Node) -> Result<(), AppError> {
 
     while let Some(cur_id) = q.pop_front() {
         let cur = get_latest_info(conn, cur_id)?;
-        if cur.nodes.is_empty() { continue }
+        if cur.nodes.is_empty() {
+            continue;
+        }
 
-        let (get_dim, dir): (fn(&Node) -> i32, &str)= match cur.layout {
+        let (get_dim, dir): (fn(&Node) -> i32, &str) = match cur.layout {
             NodeLayout::SplitH => (|n| n.rect.width, "right"),
             NodeLayout::SplitV => (|n| n.rect.height, "down"),
             _ => break,
@@ -85,11 +89,13 @@ fn balance(conn: &mut Connection, root: &Node) -> Result<(), AppError> {
             // in the adjacent container to grow into.
             let mut succeeded = true;
 
-            // Once all except the last been resized, 
+            // Once all except the last been resized,
             // the last one should already have the right size
-            let all_except_last = cur.nodes.iter()
-                .take(cur.nodes.len()-1)
-                .map(|Node {id,..}| id);
+            let all_except_last = cur
+                .nodes
+                .iter()
+                .take(cur.nodes.len() - 1)
+                .map(|Node { id, .. }| id);
 
             for child_id in all_except_last {
                 let child = get_latest_info(conn, *child_id).unwrap();
@@ -99,14 +105,17 @@ fn balance(conn: &mut Connection, root: &Node) -> Result<(), AppError> {
                 let diff = diff.abs();
 
                 let child_id = child.id;
-                let cmd = format!("[con_id={child_id}] resize {change} {dir} {diff} px");
+                let cmd = format!(
+                    "[con_id={child_id}] resize {change} {dir} {diff} px"
+                );
 
                 // run_command returns a Result<Vec<Result<_,_>>,_>.
-                // The outermost result indicates whether executing the command 
+                // The outermost result indicates whether executing the command
                 // went wrong in some way. The innermost vector of results
-                // indicates, for each command, the result of executing the 
+                // indicates, for each command, the result of executing the
                 // command. The outermost Result may not go wrong here
-                let res = conn.run_command(cmd).map_err(|_| AppError::Resize)?;
+                let res =
+                    conn.run_command(cmd).map_err(|_| AppError::Resize)?;
 
                 // The innermost command can only be of the "cannot resize" type
                 // any other error is unexpected and should propegate
@@ -120,7 +129,9 @@ fn balance(conn: &mut Connection, root: &Node) -> Result<(), AppError> {
                     }
                 };
             }
-            if succeeded { break }
+            if succeeded {
+                break;
+            }
         }
         q.extend(cur.nodes.iter().map(|n| n.id));
     }
@@ -128,37 +139,37 @@ fn balance(conn: &mut Connection, root: &Node) -> Result<(), AppError> {
     Ok(())
 }
 
-
-fn main() -> Result<(),AppError> {
+fn main() -> Result<(), AppError> {
     let arg_matches = Command::new("sway-balance")
         .author("Rintse")
         .about("Balance a sway workspace, or some focus therein")
-        .arg(Arg::new("focus")
-            .long("focus")
-            .short('f')
-            .help("Balance the focus, instead of the entire container")
-            .action(clap::ArgAction::SetTrue))
+        .arg(
+            Arg::new("focus")
+                .long("focus")
+                .short('f')
+                .help("Balance the focus, instead of the entire container")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
-    let mut conn = swayipc::Connection::new()
-        .map_err(|_| AppError::Conn)?;
+    let mut conn = swayipc::Connection::new().map_err(|_| AppError::Conn)?;
 
-    let tree = conn.get_tree()
-        .map_err(|_| AppError::GetTree)?;
-    let workspaces = conn.get_workspaces()
-        .map_err(|_| AppError::GetWorkspaces)?;
+    let tree = conn.get_tree().map_err(|_| AppError::GetTree)?;
+    let workspaces =
+        conn.get_workspaces().map_err(|_| AppError::GetWorkspaces)?;
 
-    let focused_workspace = workspaces.iter()
+    let focused_workspace = workspaces
+        .iter()
         .find(|w| w.focused)
         .ok_or(AppError::NoFocus)?;
-    let focused_workspace_node = find_by_id(&tree, focused_workspace.id)
-        .ok_or(AppError::NoFocus)?;
+    let focused_workspace_node =
+        find_by_id(&tree, focused_workspace.id).ok_or(AppError::NoFocus)?;
 
-    let to_balance = match arg_matches.get_flag("focus") {
-        true => top_focus(focused_workspace_node).ok_or(AppError::NoFocus)?,
-        false => focused_workspace_node,
+    let to_balance = if arg_matches.get_flag("focus") {
+        top_focus(focused_workspace_node).ok_or(AppError::NoFocus)?
+    } else {
+        focused_workspace_node
     };
-    
+
     balance(&mut conn, to_balance)
 }
-
